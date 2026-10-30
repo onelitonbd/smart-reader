@@ -1,0 +1,25 @@
+{
+  "name": "smart-reader",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "generate:books": "node scripts/generate-books.mjs"
+  },
+  "dependencies": {
+    "@fontsource-variable/manrope": "^5.2.6",
+    "@fontsource-variable/newsreader": "^5.2.6",
+    "lucide-react": "^0.468.0",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "pdf-lib": "^1.17.1",
+    "vite": "^6.0.5"
+  }
+}
