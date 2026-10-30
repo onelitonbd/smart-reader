@@ -10,11 +10,13 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Database,
   Download,
   Feather,
   FileText,
   FileUp,
   Headphones,
+  Highlighter,
   LibraryBig,
   Lightbulb,
   List,
@@ -44,6 +46,16 @@ import PdfViewer from './components/PdfViewer';
 import { initialBooks, starterNotes } from './data/books';
 import usePersistentState from './hooks/usePersistentState';
 import { getPageText, pdfjs } from './lib/pdf';
+import { createBackup, downloadBlob, mergeById, readBackup } from './lib/backup';
+import { formatBytes } from './lib/format';
+import {
+  getAppState,
+  getStorageEstimate,
+  getStoredDocuments,
+  requestPersistentStorage,
+  saveAppState,
+  saveStoredDocument,
+} from './lib/offlineDb';
 
 const defaultBookmarks = [
   { id: 'starter-bookmark', docId: 'noticing', page: 6, createdAt: new Date().toISOString() },
@@ -84,14 +96,18 @@ function formatTimer(seconds) {
 }
 
 export default function App() {
-  const [books, setBooks] = useState(() => {
+  const initialProgressRef = useRef(null);
+  if (initialProgressRef.current === null) {
     try {
-      const progress = JSON.parse(window.localStorage.getItem('smart-reader-progress') || '{}');
-      return initialBooks.map((book) => ({ ...book, currentPage: progress[book.id] || book.currentPage }));
+      initialProgressRef.current = JSON.parse(window.localStorage.getItem('smart-reader-progress') || '{}');
     } catch {
-      return initialBooks;
+      initialProgressRef.current = {};
     }
-  });
+  }
+  const [books, setBooks] = useState(() => initialBooks.map((book) => ({
+    ...book,
+    currentPage: initialProgressRef.current[book.id] || book.currentPage,
+  })));
   const [activeBookId, setActiveBookId] = useState('noticing');
   const [view, setView] = useState('reader');
   const [pdf, setPdf] = useState(null);
@@ -117,12 +133,17 @@ export default function App() {
   const [timerSeconds, setTimerSeconds] = useState(25 * 60);
   const [timerRunning, setTimerRunning] = useState(false);
   const [libraryFilter, setLibraryFilter] = useState('all');
+  const [offlineReady, setOfflineReady] = useState(false);
+  const [backupBusy, setBackupBusy] = useState('');
+  const [storageInfo, setStorageInfo] = useState({ usage: 0, quota: 0 });
 
   const [bookmarks, setBookmarks] = usePersistentState('smart-reader-bookmarks', defaultBookmarks);
   const [notes, setNotes] = usePersistentState('smart-reader-notes', starterNotes);
+  const [highlights, setHighlights] = usePersistentState('smart-reader-highlights', []);
   const [settings, setSettings] = usePersistentState('smart-reader-settings', { theme: 'paper', speechRate: 1 });
 
   const uploadRef = useRef(null);
+  const backupInputRef = useRef(null);
   const searchInputRef = useRef(null);
   const searchRequestRef = useRef(0);
   const toastTimerRef = useRef(null);
@@ -140,6 +161,9 @@ export default function App() {
   }, [activeBook, currentPage]);
   const chapterNumber = Math.max(1, activeBook.outline?.findIndex((item) => item.title === activeChapter.title) + 1 || 1);
   const activeNotes = notes.filter((note) => note.docId === activeBook.id);
+  const activeHighlights = highlights.filter((highlight) => highlight.docId === activeBook.id);
+  const pageHighlights = activeHighlights.filter((highlight) => highlight.page === currentPage);
+  const progressByBook = useMemo(() => Object.fromEntries(books.map((book) => [book.id, book.currentPage])), [books]);
 
   const showToast = useCallback((message) => {
     setToast(message);
@@ -147,21 +171,62 @@ export default function App() {
     toastTimerRef.current = window.setTimeout(() => setToast(''), 2800);
   }, []);
 
+  const refreshStorageInfo = useCallback(() => {
+    getStorageEstimate().then(setStorageInfo);
+  }, []);
+
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme || 'paper';
   }, [settings.theme]);
 
   useEffect(() => {
-    const savedProgress = Object.fromEntries(initialBooks.map((book) => {
-      const current = books.find((item) => item.id === book.id);
-      return [book.id, current?.currentPage || book.currentPage];
-    }));
+    let cancelled = false;
+    Promise.all([getStoredDocuments(), getAppState('smart-reader-progress')]).then(([records, offlineProgress]) => {
+      if (cancelled) return;
+      const savedProgress = { ...initialProgressRef.current, ...(offlineProgress || {}) };
+      const restoredBooks = records.filter((record) => record.file instanceof Blob).map((record) => ({
+        ...record,
+        currentPage: savedProgress[record.id] || record.currentPage || 1,
+        url: URL.createObjectURL(record.file),
+        isUpload: true,
+      }));
+      setBooks((previous) => [
+        ...previous,
+        ...restoredBooks.filter((restored) => !previous.some((book) => book.id === restored.id)),
+      ].map((book) => ({
+        ...book,
+        currentPage: Math.min(savedProgress[book.id] || book.currentPage, book.totalPages || 1),
+      })));
+      setOfflineReady(true);
+      refreshStorageInfo();
+    }).catch((error) => {
+      console.warn('Offline library could not be restored:', error);
+      setOfflineReady(false);
+    });
+    return () => { cancelled = true; };
+  }, [refreshStorageInfo]);
+
+  useEffect(() => {
     try {
-      window.localStorage.setItem('smart-reader-progress', JSON.stringify(savedProgress));
+      window.localStorage.setItem('smart-reader-progress', JSON.stringify(progressByBook));
     } catch {
-      // Progress persistence is optional when browser storage is blocked.
+      // IndexedDB remains available when localStorage is blocked.
     }
-  }, [books]);
+    if (offlineReady) saveAppState('smart-reader-progress', progressByBook).catch(() => {});
+  }, [progressByBook, offlineReady]);
+
+  useEffect(() => {
+    if (!offlineReady || !activeBook.isUpload || !activeBook.file) return undefined;
+    const timeout = window.setTimeout(() => {
+      saveStoredDocument(activeBook, activeBook.file)
+        .then(refreshStorageInfo)
+        .catch((error) => {
+          console.warn('Reading position could not be saved offline:', error);
+          setOfflineReady(false);
+        });
+    }, 500);
+    return () => window.clearTimeout(timeout);
+  }, [activeBook.id, activeBook.isUpload, activeBook.file, currentPage, totalPages, offlineReady, refreshStorageInfo]);
 
   useEffect(() => {
     let cancelled = false;
@@ -372,7 +437,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [currentPage, goToPage, openSearch, settingsOpen, toggleBookmark, view]);
 
-  const handleUpload = (file) => {
+  const handleUpload = async (file) => {
     if (!file) return;
     if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
       showToast('Please choose a PDF file.');
@@ -398,12 +463,24 @@ export default function App() {
       description: 'Imported from your device. Add notes and bookmarks as you read.',
       outline: [],
       isUpload: true,
+      file,
+      createdAt: new Date().toISOString(),
     };
     setBooks((previous) => [...previous, importedBook]);
     setActiveBookId(id);
     setView('reader');
     setDragging(false);
-    showToast(`“${importedBook.title}” is ready to read`);
+    requestPersistentStorage();
+    try {
+      await saveStoredDocument(importedBook, file);
+      setOfflineReady(true);
+      refreshStorageInfo();
+      showToast(`“${importedBook.title}” is saved for offline reading`);
+    } catch (error) {
+      console.warn('PDF could not be saved offline:', error);
+      setOfflineReady(false);
+      showToast('PDF opened, but offline save failed. Please export a backup.');
+    }
     if (uploadRef.current) uploadRef.current.value = '';
   };
 
@@ -433,7 +510,26 @@ export default function App() {
     showToast('Note deleted');
   };
 
-  const openLocation = (docId, page, showNotes = false) => {
+  const addHighlight = ({ text, rects, color }) => {
+    const highlight = {
+      id: `highlight-${Date.now()}`,
+      docId: activeBook.id,
+      page: currentPage,
+      text,
+      rects,
+      color,
+      createdAt: new Date().toISOString(),
+    };
+    setHighlights((previous) => [highlight, ...previous]);
+    showToast(`Highlight saved on page ${currentPage}`);
+  };
+
+  const deleteHighlight = (highlightId) => {
+    setHighlights((previous) => previous.filter((highlight) => highlight.id !== highlightId));
+    showToast('Highlight removed');
+  };
+
+  const openLocation = (docId, page, companionToOpen = null) => {
     const destinationBook = books.find((book) => book.id === docId);
     if (!destinationBook) return;
     const destination = Math.min(Math.max(Number(page) || 1, 1), destinationBook.totalPages || 1);
@@ -443,12 +539,88 @@ export default function App() {
     setView('reader');
     setMobileNavOpen(false);
     setSearchOpen(false);
-    setCompanionOpen(showNotes);
-    if (showNotes) setCompanionTab('notes');
+    setCompanionOpen(Boolean(companionToOpen));
+    if (companionToOpen) setCompanionTab(companionToOpen);
   };
 
-  const openNote = (note) => openLocation(note.docId, note.page, true);
+  const openNote = (note) => openLocation(note.docId, note.page, 'notes');
   const openBookmark = (bookmark) => openLocation(bookmark.docId, bookmark.page);
+  const openHighlight = (highlight) => openLocation(highlight.docId, highlight.page, 'highlights');
+
+  const exportBackup = async () => {
+    if (backupBusy) return;
+    setBackupBusy('export');
+    try {
+      const blob = await createBackup({
+        books,
+        notes,
+        bookmarks,
+        highlights,
+        settings,
+        progress: progressByBook,
+      });
+      const date = new Date().toISOString().slice(0, 10);
+      downloadBlob(blob, `smart-reader-backup-${date}.zip`);
+      showToast('Backup exported. Keep it somewhere safe.');
+    } catch (error) {
+      console.warn('Backup export failed:', error);
+      showToast('Backup could not be exported. Please try again.');
+    } finally {
+      setBackupBusy('');
+      refreshStorageInfo();
+    }
+  };
+
+  const importBackup = async (file) => {
+    if (!file || backupBusy) return;
+    setBackupBusy('import');
+    try {
+      if (file.size > 200 * 1024 * 1024) throw new Error('Please choose a backup smaller than 200 MB.');
+      const backup = await readBackup(file);
+      const mergedProgress = { ...progressByBook, ...backup.progress };
+      const restoredBooks = [];
+      for (const document of backup.documents) {
+        const book = {
+          ...document.book,
+          currentPage: mergedProgress[document.book.id] || document.book.currentPage || 1,
+          file: document.file,
+          url: URL.createObjectURL(document.file),
+          isUpload: true,
+        };
+        await saveStoredDocument(book, document.file);
+        restoredBooks.push(book);
+      }
+
+      setBooks((previous) => {
+        const merged = new Map(previous.map((book) => [book.id, book]));
+        restoredBooks.forEach((book) => merged.set(book.id, book));
+        return [...merged.values()].map((book) => ({
+          ...book,
+          currentPage: mergedProgress[book.id] || book.currentPage,
+        }));
+      });
+      setNotes((previous) => mergeById(previous, backup.notes));
+      setBookmarks((previous) => mergeById(previous, backup.bookmarks));
+      setHighlights((previous) => mergeById(previous, backup.highlights));
+      setSettings((previous) => ({ ...previous, ...backup.settings }));
+      try {
+        window.localStorage.setItem('smart-reader-progress', JSON.stringify(mergedProgress));
+      } catch {
+        // The IndexedDB documents and annotations remain imported.
+      }
+      setOfflineReady(true);
+      requestPersistentStorage();
+      refreshStorageInfo();
+      setSettingsOpen(false);
+      showToast(`Backup imported: ${restoredBooks.length} PDFs and ${backup.highlights.length} highlights.`);
+    } catch (error) {
+      console.warn('Backup import failed:', error);
+      showToast(error.message || 'This backup could not be imported.');
+    } finally {
+      setBackupBusy('');
+      if (backupInputRef.current) backupInputRef.current.value = '';
+    }
+  };
 
   const commitPageInput = () => {
     goToPage(pageInput);
@@ -461,7 +633,15 @@ export default function App() {
     return true;
   });
 
-  const viewTitle = view === 'library' ? 'My library' : view === 'bookmarks' ? 'Bookmarks' : view === 'notes' ? 'Notes' : activeBook.title;
+  const viewTitle = view === 'library'
+    ? 'My library'
+    : view === 'bookmarks'
+      ? 'Bookmarks'
+      : view === 'highlights'
+        ? 'Highlights'
+        : view === 'notes'
+          ? 'Notes'
+          : activeBook.title;
 
   return (
     <div
@@ -483,6 +663,13 @@ export default function App() {
         accept="application/pdf,.pdf"
         className="visually-hidden"
         onChange={(event) => handleUpload(event.target.files?.[0])}
+      />
+      <input
+        ref={backupInputRef}
+        type="file"
+        accept=".zip,application/zip"
+        className="visually-hidden"
+        onChange={(event) => importBackup(event.target.files?.[0])}
       />
 
       {mobileNavOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
@@ -507,6 +694,9 @@ export default function App() {
           </button>
           <button className={view === 'bookmarks' ? 'active' : ''} onClick={() => changeView('bookmarks')}>
             <Bookmark size={18} /><span>Bookmarks</span><small>{bookmarks.length}</small>
+          </button>
+          <button className={view === 'highlights' ? 'active' : ''} onClick={() => changeView('highlights')}>
+            <Highlighter size={18} /><span>Highlights</span><small>{highlights.length}</small>
           </button>
           <button className={view === 'notes' ? 'active' : ''} onClick={() => changeView('notes')}>
             <NotebookPen size={18} /><span>My notes</span><small>{notes.length}</small>
@@ -541,7 +731,7 @@ export default function App() {
         </div>
         <div className="sidebar-profile">
           <span className="profile-avatar">S<span /></span>
-          <span><strong>My reading space</strong><small>Saved on this device</small></span>
+          <span><strong>My reading space</strong><small>{offlineReady ? 'Offline storage active' : 'Local storage only'}</small></span>
           <IconButton label="Reading preferences" onClick={() => setSettingsOpen(true)}><Settings2 size={17} /></IconButton>
         </div>
       </aside>
@@ -620,7 +810,7 @@ export default function App() {
                 <span className="reader-context__divider" />
                 <strong>{activeChapter.title}</strong>
               </div>
-              <span className="progress-saved"><CheckCircle2 size={14} /> Progress saved</span>
+              <span className="highlight-hint"><Highlighter size={14} /> Select text to highlight</span>
             </div>
 
             <PdfViewer
@@ -631,6 +821,8 @@ export default function App() {
               loading={pdfLoading}
               error={pdfError}
               onRetry={() => uploadRef.current?.click()}
+              highlights={pageHighlights}
+              onAddHighlight={addHighlight}
             />
 
             <div className="reader-bottom">
@@ -654,6 +846,7 @@ export default function App() {
                 <IconButton label="Zoom in" className="zoom-control" onClick={() => setZoom((value) => Math.min(180, value + 10))} disabled={zoom >= 180}><ZoomIn size={18} /></IconButton>
                 <span className="control-divider control-divider--second" />
                 <IconButton label="Rotate page" className="rotate-control" onClick={() => setRotation((value) => (value + 90) % 360)}><RotateCw size={17} /></IconButton>
+                <IconButton label="View highlights on this page" className={pageHighlights.length ? 'is-bookmarked' : ''} onClick={() => { setCompanionOpen(true); setCompanionTab('highlights'); }}><Highlighter size={17} /></IconButton>
                 <IconButton label={currentBookmark ? 'Remove bookmark (B)' : 'Bookmark this page (B)'} className={currentBookmark ? 'is-bookmarked' : ''} onClick={toggleBookmark}>
                   <Bookmark size={18} fill={currentBookmark ? 'currentColor' : 'none'} />
                 </IconButton>
@@ -749,6 +942,36 @@ export default function App() {
           </section>
         )}
 
+        {view === 'highlights' && (
+          <section className="collection-view">
+            <div className="collection-heading">
+              <div><span className="eyebrow"><Highlighter size={14} /> Ideas worth keeping</span><h1>Highlights<span>.</span></h1><p>Every marked passage, ready whenever you want to return.</p></div>
+              <button className="button button--secondary" onClick={() => changeView('reader')}><Highlighter size={16} /> Mark a passage</button>
+            </div>
+            {highlights.length ? (
+              <div className="highlights-grid">
+                {highlights.map((highlight) => {
+                  const book = books.find((item) => item.id === highlight.docId);
+                  if (!book) return null;
+                  return (
+                    <article className={`highlight-card highlight-card--${highlight.color || 'yellow'}`} key={highlight.id}>
+                      <div className="highlight-card__top">
+                        <span><Highlighter size={14} /> Page {highlight.page}</span>
+                        <IconButton label="Delete highlight" onClick={() => deleteHighlight(highlight.id)}><Trash2 size={15} /></IconButton>
+                      </div>
+                      <p>“{highlight.text}”</p>
+                      <div className="highlight-card__book"><span style={{ background: book.accent }} />{book.title}</div>
+                      <div className="highlight-card__footer"><span>{formatNoteDate(highlight.createdAt)}</span><button onClick={() => openHighlight(highlight)}>Open in book <ArrowUpRight size={14} /></button></div>
+                    </article>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="empty-state"><span><Highlighter size={28} /></span><h2>Mark what moves you</h2><p>Select any text in your PDF, then choose a color. Your highlights will be saved on this device.</p><button className="button button--primary" onClick={() => changeView('reader')}>Start highlighting</button></div>
+            )}
+          </section>
+        )}
+
         {view === 'notes' && (
           <section className="collection-view">
             <div className="collection-heading">
@@ -803,11 +1026,12 @@ export default function App() {
               </section>
 
               <div className="companion-tabs" role="tablist">
-                <button role="tab" aria-selected={companionTab === 'notes'} className={companionTab === 'notes' ? 'active' : ''} onClick={() => setCompanionTab('notes')}><NotebookPen size={15} /> Notes <span>{activeNotes.length}</span></button>
-                <button role="tab" aria-selected={companionTab === 'outline'} className={companionTab === 'outline' ? 'active' : ''} onClick={() => setCompanionTab('outline')}><List size={15} /> Outline</button>
+                <button role="tab" aria-selected={companionTab === 'notes'} className={companionTab === 'notes' ? 'active' : ''} onClick={() => setCompanionTab('notes')}><NotebookPen size={14} /> Notes <span>{activeNotes.length}</span></button>
+                <button role="tab" aria-selected={companionTab === 'highlights'} className={companionTab === 'highlights' ? 'active' : ''} onClick={() => setCompanionTab('highlights')}><Highlighter size={14} /> Marks <span>{activeHighlights.length}</span></button>
+                <button role="tab" aria-selected={companionTab === 'outline'} className={companionTab === 'outline' ? 'active' : ''} onClick={() => setCompanionTab('outline')}><List size={14} /> Outline</button>
               </div>
 
-              {companionTab === 'notes' ? (
+              {companionTab === 'notes' && (
                 <div className="notes-panel">
                   <section className="note-editor">
                     <div className="note-editor__label"><span>Page {currentPage}</span><Lightbulb size={15} /></div>
@@ -827,7 +1051,26 @@ export default function App() {
                     </button>
                   ))}
                 </div>
-              ) : (
+              )}
+
+              {companionTab === 'highlights' && (
+                <div className="marks-panel">
+                  <div className="highlight-instruction"><Highlighter size={16} /><p><strong>Select. Mark. Keep.</strong>Select text on the page, then choose a color. It stays here after reload.</p></div>
+                  <span className="marks-panel__label">On page {currentPage}</span>
+                  {pageHighlights.length ? pageHighlights.map((highlight) => (
+                    <article className={`saved-highlight saved-highlight--${highlight.color || 'yellow'}`} key={highlight.id}>
+                      <span className="saved-highlight__color" />
+                      <div><p>“{highlight.text}”</p><span>{formatNoteDate(highlight.createdAt)}</span></div>
+                      <IconButton label="Delete highlight" onClick={() => deleteHighlight(highlight.id)}><Trash2 size={14} /></IconButton>
+                    </article>
+                  )) : (
+                    <div className="marks-empty"><span><Highlighter size={20} /></span><p>No marks on this page yet.<br />Your selected passages will appear here.</p></div>
+                  )}
+                  {activeHighlights.length > pageHighlights.length && <button className="view-all-marks" onClick={() => changeView('highlights')}>View all {activeHighlights.length} highlights in this book <ArrowUpRight size={13} /></button>}
+                </div>
+              )}
+
+              {companionTab === 'outline' && (
                 <div className="outline-panel">
                   <span className="outline-panel__label">In this book</span>
                   {activeBook.outline?.length ? activeBook.outline.map((item, index) => (
@@ -871,6 +1114,20 @@ export default function App() {
               <div><label htmlFor="speech-rate">Read aloud pace</label><p>Set a comfortable speed for page narration.</p></div>
               <span>{Number(settings.speechRate || 1).toFixed(1)}×</span>
               <input id="speech-rate" type="range" min="0.7" max="1.4" step="0.1" value={settings.speechRate || 1} onChange={(event) => setSettings((previous) => ({ ...previous, speechRate: Number(event.target.value) }))} />
+            </div>
+            <div className="settings-group backup-settings">
+              <div className="backup-settings__heading"><div><label>Offline backup</label><p>Keep your library portable, private, and safe.</p></div><Database size={20} /></div>
+              <div className="storage-meter"><span style={{ width: storageInfo.quota ? `${Math.max(2, Math.min(100, (storageInfo.usage / storageInfo.quota) * 100))}%` : '2%' }} /></div>
+              <div className="storage-meta"><span>{formatBytes(storageInfo.usage)} used on this device</span><span>{offlineReady ? 'IndexedDB active' : 'Local storage'}</span></div>
+              <div className="backup-actions">
+                <button className="button button--secondary" onClick={exportBackup} disabled={Boolean(backupBusy)}>
+                  {backupBusy === 'export' ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />} Export backup
+                </button>
+                <button className="button button--secondary" onClick={() => backupInputRef.current?.click()} disabled={Boolean(backupBusy)}>
+                  {backupBusy === 'import' ? <LoaderCircle size={15} className="spin" /> : <Upload size={15} />} Import backup
+                </button>
+              </div>
+              <small>One ZIP with your PDFs, highlights, notes, bookmarks, and reading progress.</small>
             </div>
             <div className="settings-group shortcuts">
               <label>Keyboard shortcuts</label>

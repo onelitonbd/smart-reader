@@ -1,21 +1,29 @@
 # Smart Reader
 
-A calm, beautiful PDF reading workspace built with React, Vite, and PDF.js. Smart Reader turns ordinary documents into a focused reading experience with a personal library, reading progress, notes, bookmarks, and read-aloud support.
+A calm, beautiful, **offline-first PDF reading workspace** built with React, Vite, PDF.js, and IndexedDB. Smart Reader keeps your documents and reading data on your own device—no account, cloud database, or paid storage required.
 
 ## Features
 
-- **Real PDF reading** — upload a PDF or explore three included sample books.
-- **Responsive reader** — automatic page fitting, 60–180% zoom, rotation, and page navigation.
-- **Full-text search** — search extracted PDF text and jump directly to matching pages.
-- **Reading companion** — per-page notes, document outline, progress ring, and a 25-minute focus timer.
-- **Read aloud** — browser speech synthesis with an adjustable narration pace.
-- **Personal collections** — dedicated library, bookmark, and note views.
-- **Reading atmospheres** — Paper, Sepia, and Night themes.
-- **Focus mode** — hide the navigation and companion panels for distraction-free reading.
-- **Local progress** — reading positions, notes, bookmarks, and preferences are saved in local storage.
-- **Drag and drop** — drop a PDF anywhere in the app to begin reading.
+### Reading and annotation
 
-Uploaded PDF files remain available for the current browser session. Sample-book progress, notes, bookmarks, and preferences persist across reloads.
+- **Real PDF reading** — import a PDF or explore three included sample books.
+- **Text highlights** — select PDF text and save yellow, green, pink, or blue marks.
+- **Stable highlight geometry** — marks remain aligned after zooming, resizing, rotating, or reloading.
+- **Reading collections** — dedicated library, highlight, bookmark, and note views.
+- **Full-text search** — search extracted PDF text and jump directly to matching pages.
+- **Read aloud** — browser speech synthesis with an adjustable narration pace.
+- **Reading companion** — per-page notes, document outline, progress ring, and a 25-minute focus timer.
+- **Reading atmospheres** — Paper, Sepia, and Night themes plus distraction-free focus mode.
+
+### Offline storage and backup
+
+- **IndexedDB persistence** — uploaded PDFs, highlights, notes, bookmarks, settings, and reading progress survive reloads.
+- **LocalStorage fallback** — small reading-data records also have a synchronous browser fallback.
+- **Offline PWA** — the app shell, fonts, PDF engine, and sample books are precached for offline reading.
+- **Persistent-storage request** — supporting browsers are asked to protect offline data from automatic eviction.
+- **ZIP backup export** — one portable file containing uploaded PDF binaries and all reading data.
+- **Merged backup import** — restore a backup without deleting unrelated documents or annotations already on the device.
+- **No server upload** — documents and annotations stay in the browser unless you explicitly export them.
 
 ## Run locally
 
@@ -32,6 +40,18 @@ The Vite server listens on `0.0.0.0` for local and preview-environment access.
 npm run build
 npm run preview
 ```
+
+The production build generates a service worker and web app manifest. Service-worker offline support is available in the production build, not the development server.
+
+## Backup and restore
+
+1. Open **Reading preferences** from the sidebar or reading companion.
+2. Find **Offline backup**.
+3. Choose **Export backup** to download a dated Smart Reader ZIP.
+4. Keep the ZIP somewhere safe, such as an external drive or your preferred cloud storage.
+5. Choose **Import backup** on the same or another device to merge the saved PDFs and reading data back into your library.
+
+The backup contains uploaded PDFs, highlights, notes, bookmarks, settings, and reading progress. Built-in sample books are already included with the app and are not duplicated in the ZIP.
 
 ## Regenerate sample books
 
@@ -55,19 +75,24 @@ npm run generate:books
 ## Project structure
 
 ```text
-public/books/          Included sample PDFs
-public/images/         Editorial cover artwork
-scripts/               Sample-book generator
-src/components/        PDF canvas and book-cover components
-src/data/              Book metadata and starter content
-src/hooks/             Local-storage state hook
-src/lib/               PDF.js setup and text extraction
-src/App.jsx            Application state and views
-src/styles.css         Responsive visual system and themes
+public/books/                  Included sample PDFs
+public/icons/                  Installable app icons
+public/images/                 Editorial cover artwork
+scripts/                       Sample-book generator
+src/components/                PDF canvas, text layer, and book covers
+src/data/                      Book metadata and starter content
+src/hooks/                     IndexedDB-backed persistent state
+src/lib/pdf.js                 PDF.js setup and text extraction
+src/lib/offlineDb.js           IndexedDB document and app-state stores
+src/lib/backup.js              ZIP backup creation and restoration
+src/lib/highlightGeometry.js   Rotation-safe normalized highlight coordinates
+src/App.jsx                    Application state and views
+src/styles.css                 Responsive visual system and themes
 ```
 
-## Notes
+## Browser notes
 
-- PDF rendering runs locally in the browser; documents are not sent to a server.
+- PDF rendering and text extraction run locally; documents are never sent to an application server.
 - Read aloud requires a browser with the Web Speech API.
-- Notes and bookmarks are stored only in the current browser.
+- Highlighting works with PDFs containing selectable text. Image-only scans require OCR before text can be selected.
+- Browser storage is not unlimited. The settings panel shows the current storage estimate; keep periodic ZIP backups for additional safety.
